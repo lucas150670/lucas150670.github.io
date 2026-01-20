@@ -106,62 +106,44 @@
 <p>注意这里有个坑：mfc里的CFile::SeekPosition和whence不能直接转换，要手动转换一下。</p>
 <p>read_func_wrapper和seek_func_wrapper是静态函数，将第一个void*指针转换为MusicPlayer对象，然后调用自己的方法，做了一个简单的包装。</p>
 <p>还有一个坑：每次读取之前需要重置一下file_stream_end。因为读取ogg等格式的时候需要扫描到文件尾，如果file_stream_end被标记后不清除会影响到ffmpeg的解码，表现为读文件后立刻playback end。</p>
+<p>load_audio_context本质上是对load_audio_context_stream的包装，负责将文件读入CFile后调用load_audio_context_stream进行实际的解码操作。注意load_audio_context_stream这里接受一个<strong>CFile</strong>*类型，实际上我们既可以传入CStdioFile（磁盘文件），也可以传入CMemFile（内存流），方便读取已经完整加载到内存中的音频数据。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (!file_stream-&gt;<span class="built_in">Open</span>(audio_filename, CFile::modeRead | CFile::shareDenyWrite))</span><br><span class="line">&#123;</span><br><span class="line">	<span class="built_in">ATLTRACE</span>(<span class="string">&quot;err: file not exists!\n&quot;</span>);</span><br><span class="line">	<span class="keyword">delete</span> file_stream;</span><br><span class="line">	<span class="keyword">return</span> <span class="number">-1</span>;</span><br><span class="line">&#125;</span><br><span class="line"><span class="comment">// ... ncm decrypt code ...</span></span><br><span class="line"><span class="keyword">return</span> <span class="built_in">load_audio_context_stream</span>(file_stream);</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">int</span> <span class="title">MusicPlayer::load_audio_context_stream</span><span class="params">(CFile* in_file_stream)</span></span>; <span class="comment">// signature</span></span><br></pre></td></tr></table></figure>
+
+<p>接下来开始拆解load_audio_context_stream中的逻辑。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (!in_file_stream)</span><br><span class="line">	<span class="keyword">return</span> <span class="number">-1</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这个没什么好说的，最基础的空指针检查。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">in_file_stream-&gt;<span class="built_in">SeekToBegin</span>();</span><br></pre></td></tr></table></figure>
+
+<p>有人可能会觉得这一步是没有必要的，但是在播放完成一首曲目后从头开始播放，在目前的实现里就需要重新做一次load_audio_context_stream（不重新加载文件，利用已经打开的CFile*），而这时候CFile*的位置游标没有正确归位，会导致立刻EOF然后退出。所以这里要对in_file_stream的位置游标进行复位，让其指向文件开头，从而开始正确的解码流程。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">char</span>* buf = DBG_NEW <span class="type">char</span>[<span class="number">1024</span>];</span><br><span class="line"><span class="built_in">memset</span>(buf, <span class="number">0</span>, <span class="built_in">sizeof</span>(<span class="type">char</span>) * <span class="number">1024</span>);</span><br></pre></td></tr></table></figure>
+
+<p>这个buf是给av_strerror用的，用来存储当ffmpeg操作失败时产生错误码对应的文字消息。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">size_t</span> file_len = <span class="built_in">static_cast</span>&lt;<span class="type">int64_t</span>&gt;(in_file_stream-&gt;<span class="built_in">GetLength</span>());</span><br><span class="line"><span class="built_in">ATLTRACE</span>(<span class="string">&quot;info: file loaded, size = %zu\n&quot;</span>, file_len);</span><br></pre></td></tr></table></figure>
+
+<p>获取文件流的长度并打印在终端上。没什么好说的。</p>
+<h3 id="初始化解码器"><a href="#初始化解码器" class="headerlink" title="初始化解码器"></a>初始化解码器</h3><p>讲解接下来的代码之前，先引入一下MusicPlayer类的部分字段定义：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">class</span> <span class="title class_">MusicPlayer</span></span><br><span class="line">&#123;</span><br><span class="line">	AVFormatContext* format_context = <span class="literal">nullptr</span>;</span><br><span class="line">	AVCodec* codec = <span class="literal">nullptr</span>;</span><br><span class="line">	AVCodecContext* codec_context = <span class="literal">nullptr</span>;</span><br><span class="line">	AVPacket* packet = <span class="literal">nullptr</span>;</span><br><span class="line">	AVFrame* frame = <span class="literal">nullptr</span>;</span><br><span class="line">	<span class="type">unsigned</span> audio_stream_index = <span class="built_in">static_cast</span>&lt;<span class="type">unsigned</span>&gt;(<span class="number">-1</span>); <span class="comment">// inf</span></span><br><span class="line">	AVIOContext* avio_context = <span class="literal">nullptr</span>;</span><br><span class="line">	<span class="type">unsigned</span> <span class="type">char</span>* buffer = <span class="literal">nullptr</span>;</span><br><span class="line">    <span class="comment">// ......</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>format_context存储ffmpeg分配的一个文件流解析context。先用avformat_alloc_context分配一个format_context，设置好对应的参数后，我们可以调用avformat_open_input打开这个context开始解码。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">format_context = <span class="built_in">avformat_alloc_context</span>(); <span class="comment">// 分配文件流解析context</span></span><br></pre></td></tr></table></figure>
+
+<p>注意我们用自定义的CFile*操作接管了ffmpeg的文件操作，所以我们要正确初始化一个avio context并绑定到这个format context上。</p>
+<p>在avio_context的初始化中，我们需要填入一个分配好的缓冲区，以及缓冲区的最大长度。后续所有操作将会由你绑定的read_packet&#x2F;write_packet&#x2F;seek函数完成，而buffer作为ffmpeg内部的io缓冲区进行数据的缓存和传递。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">constexpr</span> <span class="type">size_t</span> avio_buf_size = <span class="number">8192</span>;</span><br><span class="line">buffer = <span class="built_in">reinterpret_cast</span>&lt;<span class="type">unsigned</span> <span class="type">char</span>*&gt;(<span class="built_in">av_malloc</span>(avio_buf_size));</span><br></pre></td></tr></table></figure>
+
+<p>初始化好buffer以后，我们初始化avio_context:</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">avio_context =</span><br><span class="line">	<span class="built_in">avio_alloc_context</span>(buffer, avio_buf_size, <span class="number">0</span>,</span><br><span class="line">		<span class="keyword">this</span>,                    <span class="comment">// void *opaque</span></span><br><span class="line">		&amp;read_func_wrapper,   <span class="comment">// read_packet</span></span><br><span class="line">		<span class="literal">nullptr</span>,                <span class="comment">// write_packet</span></span><br><span class="line">		&amp;seek_func_wrapper);  <span class="comment">// seek</span></span><br></pre></td></tr></table></figure>
+
+<p>this（即这个MusicPlayer对象）会作为opaque传递到我们的回调函数当中。这个函数第三个参数代表AVIOContext是否可写，由于这个应用场景不涉及到转码等要写入到文件流的场合（仅仅用于解码），所以我们设置write_flag为0，write_packet为nullptr。ffmpeg只会使用read_packet和seek来读取文件流中的数据。</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">format_context-&gt;pb = avio_context;</span><br></pre></td></tr></table></figure>
+
+<p>最后将初始化好的avio_context挂到format_context的pb字段下，告诉ffmpeg所有关于文件I&#x2F;O都需要通过你定义的avio context进行。</p>
 
       
     </div>
     <footer class="article-footer">
-      <a data-url="https://lucas150670.github.io/2026/01/19/%E5%9F%BA%E4%BA%8EXAudio2%E5%92%8CFFMpeg%E7%9A%84%E9%9F%B3%E9%A2%91%E6%92%AD%E6%94%BE%E5%99%A8%E5%AE%9E%E7%8E%B0/" data-id="cuidFT4qYI-oGRVrhDbgjKRVh" data-title="基于XAudio2和FFMpeg的音频播放器实现" class="article-share-link"><span class="fa fa-share">Share</span></a>
-      
-      
-      
-    </footer>
-  </div>
-  
-</article>
-
-
-
-  
-    <article id="post-hello-world" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
-  <div class="article-meta">
-    <a href="/2026/01/19/hello-world/" class="article-date">
-  <time class="dt-published" datetime="2026-01-19T09:54:14.205Z" itemprop="datePublished">2026-01-19</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="p-name article-title" href="/2026/01/19/hello-world/">Hello World</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="e-content article-entry" itemprop="articleBody">
-      
-        <p>Welcome to <a target="_blank" rel="noopener" href="https://hexo.io/">Hexo</a>! This is your very first post. Check <a target="_blank" rel="noopener" href="https://hexo.io/docs/">documentation</a> for more info. If you get any problems when using Hexo, you can find the answer in <a target="_blank" rel="noopener" href="https://hexo.io/docs/troubleshooting.html">troubleshooting</a> or you can ask me on <a target="_blank" rel="noopener" href="https://github.com/hexojs/hexo/issues">GitHub</a>.</p>
-<h2 id="Quick-Start"><a href="#Quick-Start" class="headerlink" title="Quick Start"></a>Quick Start</h2><h3 id="Create-a-new-post"><a href="#Create-a-new-post" class="headerlink" title="Create a new post"></a>Create a new post</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo new <span class="string">&quot;My New Post&quot;</span></span><br></pre></td></tr></table></figure>
-
-<p>More info: <a target="_blank" rel="noopener" href="https://hexo.io/docs/writing.html">Writing</a></p>
-<h3 id="Run-server"><a href="#Run-server" class="headerlink" title="Run server"></a>Run server</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo server</span><br></pre></td></tr></table></figure>
-
-<p>More info: <a target="_blank" rel="noopener" href="https://hexo.io/docs/server.html">Server</a></p>
-<h3 id="Generate-static-files"><a href="#Generate-static-files" class="headerlink" title="Generate static files"></a>Generate static files</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo generate</span><br></pre></td></tr></table></figure>
-
-<p>More info: <a target="_blank" rel="noopener" href="https://hexo.io/docs/generating.html">Generating</a></p>
-<h3 id="Deploy-to-remote-sites"><a href="#Deploy-to-remote-sites" class="headerlink" title="Deploy to remote sites"></a>Deploy to remote sites</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ hexo deploy</span><br></pre></td></tr></table></figure>
-
-<p>More info: <a target="_blank" rel="noopener" href="https://hexo.io/docs/one-command-deployment.html">Deployment</a></p>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="https://lucas150670.github.io/2026/01/19/hello-world/" data-id="cuidtmmHwcmcO8Xrhzi9hXOtb" data-title="Hello World" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="https://lucas150670.github.io/2026/01/19/%E5%9F%BA%E4%BA%8EXAudio2%E5%92%8CFFMpeg%E7%9A%84%E9%9F%B3%E9%A2%91%E6%92%AD%E6%94%BE%E5%99%A8%E5%AE%9E%E7%8E%B0/" data-id="cuid5DVuc3vuXHLr_4A7N78vj" data-title="基于XAudio2和FFMpeg的音频播放器实现" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -205,10 +187,6 @@
         
           <li>
             <a href="/2026/01/19/%E5%9F%BA%E4%BA%8EXAudio2%E5%92%8CFFMpeg%E7%9A%84%E9%9F%B3%E9%A2%91%E6%92%AD%E6%94%BE%E5%99%A8%E5%AE%9E%E7%8E%B0/">基于XAudio2和FFMpeg的音频播放器实现</a>
-          </li>
-        
-          <li>
-            <a href="/2026/01/19/hello-world/">Hello World</a>
           </li>
         
       </ul>
